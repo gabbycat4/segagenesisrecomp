@@ -107,6 +107,17 @@ typedef struct GameSpec {
      * coverage and keep it off so a miss stays a loud regression). */
     int         tier3_floor_default;
 
+    /* ---- Controller latch point (opt-in) ----
+     * 0 (default): a wall frame's new controller state is applied at the
+     * start of the raster frame (line 0), as before.
+     * 1: hold the new state until the vblank line and apply it just before
+     * the V-int is delivered, like emulators that poll input at vblank.
+     * For games whose main loop overruns the frame and polls the pad from
+     * several places with edge detection: with the line-0 latch, the same
+     * mid-frame reader always consumes every new press first (Warriors of
+     * the Eternal Sun: text boxes never closed). */
+    int         pad_latch_at_vint;
+
     /* Optional statically-recompiled Z80 coprocessor backend. The generated
      * function executes exactly one instruction from the explicit Z80 PC and
      * returns; the shared Genesis scheduler remains responsible for cycle

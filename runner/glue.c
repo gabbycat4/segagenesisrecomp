@@ -2309,6 +2309,10 @@ static int floor_enabled(void) {
     return e;
 }
 
+static uint32_t s_jmp_tail_target;
+static uint32_t s_jmp_tail_a7;
+extern int g_split_sp_popped;
+
 void genesis_log_dispatch_miss(uint32_t addr)
 {
     g_miss_count_any++;
@@ -2340,7 +2344,17 @@ void genesis_log_dispatch_miss(uint32_t addr)
                           ? g_game_spec.expected_rom_size : (uint32_t)sizeof(g_rom);
         /* The native loose-A7 return the caller (JSR site / enclosing JSR) is
          * about to pop — the capsule must return exactly here to be safe. */
-        uint32_t expected_ret = glue_peek32(g_cpu.A[7]) & 0xFFFFFFu;
+        uint32_t ret_slot = g_cpu.A[7];
+        int jmp_tail_skip = 0;
+        if ((addr & 0xFFFFFFu) == s_jmp_tail_target && g_cpu.A[7] == s_jmp_tail_a7 &&
+            g_split_sp_popped < 0) {
+            /* Computed-JMP tail from a routine that still holds pushed
+             * bytes: its return slot is below them (see hybrid_jmp_interpret). */
+            jmp_tail_skip = -g_split_sp_popped;
+            ret_slot += (uint32_t)jmp_tail_skip;
+        }
+        s_jmp_tail_target = 0xFFFFFFFFu;     /* one dispatch only */
+        uint32_t expected_ret = glue_peek32(ret_slot) & 0xFFFFFFu;
         uint32_t run_at = addr;
 
         /* RAM-resident computed target: follow the JMP/JSR trampoline chain
@@ -2370,6 +2384,9 @@ void genesis_log_dispatch_miss(uint32_t addr)
                 int plausible = exit_pc && !(exit_pc & 1u) &&
                                 (exit_pc < rl || exit_pc >= RAM_BASE);
                 if (plausible && exit_pc == expected_ret) {
+                    /* The capsule ran the routine through its own pops to the
+                     * real return: the carried push has been consumed. */
+                    if (jmp_tail_skip) g_split_sp_popped = 0;
                     /* Clean balanced return to the native continuation. Manifest
                      * the entry + its call/jump subtree as real code leads. */
                     floor_record_coverage(addr, addr);
@@ -2609,10 +2626,23 @@ uint32_t glue_interp_seen_addr(int i) {
     return (i >= 0 && i < s_interp_seen_count) ? s_interp_seen[i] : 0;
 }
 
+/* A computed JMP is a tail edge: the generated caller has carried the
+ * routine's net stack push (e.g. an entry MOVEM) into g_split_sp_popped
+ * (negative bytes) before getting here. If this target misses and the
+ * Tier-3 floor runs it, the routine's real return address is BELOW those
+ * pushed bytes, not on top of the stack. Arm that information for exactly
+ * this dispatch (same target, same A7) so genesis_log_dispatch_miss() can
+ * validate the capsule against the right return slot. */
+static uint32_t s_jmp_tail_target = 0xFFFFFFFFu;
+static uint32_t s_jmp_tail_a7;
+
 void hybrid_jmp_interpret(uint32_t target_pc)
 {
     g_interp_total_calls++;
+    s_jmp_tail_target = target_pc & 0xFFFFFFu;
+    s_jmp_tail_a7 = g_cpu.A[7];
     call_by_address(target_pc);
+    s_jmp_tail_target = 0xFFFFFFFFu;
     /* If call_by_address didn't find it, genesis_log_dispatch_miss
      * was called, which logs it as a true miss via log_true_miss. */
 }

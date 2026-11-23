@@ -4,6 +4,7 @@
  * Z80, and our VDP, delivering V/H interrupts. Original implementation.
  */
 #include "genesis_machine.h"
+#include "../game_spec.h"   /* pad_latch_at_vint */
 #if GENESIS_HD_JOBS
 #include "genesis_raster_jobs.h"
 #endif
@@ -362,8 +363,26 @@ int machine_rb_load(const void *src, size_t len)
     return 1;
 }
 
+/* Controller state waiting for the vblank line (GameSpec.pad_latch_at_vint).
+ * Always consumed inside the same machine_run_frame_ex, so it is never live
+ * across a wall-frame boundary (snapshots/rollback see only bus.pad). */
+static uint16_t s_pad_pending[2];
+static int      s_pad_pending_set[2];
+
+static void machine_apply_pad(int port, uint16_t buttons)
+{
+    g_machine.bus.pad[port] = buttons;
+    g_machine.bus.pad_th_count[port] = 0;
+    g_machine.bus.pad_th_prev[port]  = g_machine.bus.io_data[port] & 0x40;
+}
+
 void machine_set_pad(int port, uint16_t buttons)
 {
+    if (port >= 0 && port < 2 && g_game_spec.pad_latch_at_vint) {
+        s_pad_pending[port] = buttons;
+        s_pad_pending_set[port] = 1;
+        return;
+    }
     if (port >= 0 && port < 2) {
         g_machine.bus.pad[port] = buttons;
         /* New read burst this frame: clear the 6-button TH edge counter so the
@@ -684,6 +703,13 @@ void machine_run_frame_ex(GenesisScanlineSink sink, void *user,
 #else
             m->z80.int_pending = 1;   /* level-triggered vblank IRQ assert */
 #endif
+            /* Opt-in vblank controller latch: the first pad read after the
+             * new state is the one that follows the V-int. */
+            for (int port = 0; port < 2; port++)
+                if (s_pad_pending_set[port]) {
+                    machine_apply_pad(port, s_pad_pending[port]);
+                    s_pad_pending_set[port] = 0;
+                }
             glue_own_interrupt(6, &m->vdp);
         }
 
