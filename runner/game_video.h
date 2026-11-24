@@ -76,6 +76,15 @@ typedef struct GameVideo {
      * Never enters disk states, deterministic RB images, or netplay digests. */
     size_t (*presentation_state_save)(void *dst, size_t capacity);
     int (*presentation_state_load)(const void *src, size_t size, int apply);
+    /* Optional high-resolution in-between pictures (appended; positional
+     * initializers above stay valid). presentation_scale() returns an integer
+     * factor 2..4 (anything else = off). interpolate_scaled() fills
+     * width*scale x height*scale pixels at the given phase so motion can land
+     * on sub-pixels; return zero to use interpolate()/the ordinary image for
+     * this picture. Same rules as interpolate(): owned snapshots only. */
+    int (*presentation_scale)(void);
+    int (*interpolate_scaled)(double phase, uint32_t *image, int stride,
+                              int width, int height, int scale);
 } GameVideo;
 
 /* Host-local derived frame plan, never deterministic machine/snapshot state.

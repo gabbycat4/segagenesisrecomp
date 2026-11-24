@@ -3562,6 +3562,9 @@ session_begin:;
     frame_pacer_init(&frame_pacer, perf_frequency, target_fps);
     PresentationClock presentation_clock={0};
     uint32_t *interpolation_image=NULL;size_t interpolation_capacity=0;
+    /* High-resolution in-between pictures (GameVideo.interpolate_scaled). */
+    uint32_t *hr_image=NULL,*hr_present=NULL;size_t hr_capacity=0;
+    SDL_Texture *hr_texture=NULL;int hr_tw=0,hr_th=0;
     uint64_t presentation_count=0,interpolation_count=0;
     int presentation_vsync=-1;
     SDL_RendererInfo initial_renderer_info={0};SDL_GetRendererInfo(renderer,&initial_renderer_info);
@@ -4119,7 +4122,8 @@ session_begin:;
                 if(presentation_trace)fclose(presentation_trace);
     if(g_app_config.presentation_rate)fprintf(stderr,"[presentation] guest_ticks=%u presents=%llu interpolated=%llu counter_frequency=%llu\n",
         frame_num,(unsigned long long)presentation_count,(unsigned long long)interpolation_count,(unsigned long long)perf_frequency);
-    free(interpolation_image);
+    free(interpolation_image);free(hr_image);free(hr_present);
+    if(hr_texture)SDL_DestroyTexture(hr_texture);
     host_timing_dump(&host_timing, stderr);
                 fprintf(stderr, "[input_script] exiting per script directive (code=%d)\n",
                         input_script_exit_code());
@@ -4347,6 +4351,29 @@ session_begin:;
                 if(next){interpolation_image=next;interpolation_capacity=need;}else high_refresh=0;
             }
         }
+        int hr_scale=1;
+        if(high_refresh && g_game_spec.video->presentation_scale && g_game_spec.video->interpolate_scaled) {
+            hr_scale=g_game_spec.video->presentation_scale();
+            if(hr_scale<2 || hr_scale>4)hr_scale=1;
+        }
+        if(hr_scale>1) {
+            int tw=s_screen_width*hr_scale,th=s_screen_height*hr_scale;
+            size_t need=(size_t)tw*(size_t)th;
+            if(need>hr_capacity) {
+                uint32_t *a=(uint32_t*)realloc(hr_image,need*sizeof *a);
+                if(a)hr_image=a;
+                uint32_t *b=a?(uint32_t*)realloc(hr_present,need*sizeof *b):NULL;
+                if(b)hr_present=b;
+                if(a&&b)hr_capacity=need; else hr_scale=1;
+            }
+            if(hr_scale>1 && (!hr_texture || hr_tw!=tw || hr_th!=th)) {
+                if(hr_texture)SDL_DestroyTexture(hr_texture);
+                hr_texture=SDL_CreateTexture(renderer,SDL_PIXELFORMAT_ARGB8888,SDL_TEXTUREACCESS_STREAMING,tw,th);
+                if(hr_texture){SDL_SetTextureScaleMode(hr_texture,SDL_ScaleModeNearest);hr_tw=tw;hr_th=th;}
+                else {fprintf(stderr,"[presentation] high-resolution texture unavailable: %s\n",SDL_GetError());hr_tw=hr_th=0;}
+            }
+            if(!hr_texture)hr_scale=1;
+        }
         if(high_refresh) {
             Uint64 now=SDL_GetPerformanceCounter();
             presentation_clock_begin(&presentation_clock,perf_frequency,display_rate,guest_deadline);
@@ -4356,8 +4383,23 @@ session_begin:;
                 /* A late draw drops an output deadline rather than queuing
                  * overdue pictures or changing the guest clock. */
                 if(now>at && now-at>(Uint64)((double)perf_frequency/display_rate))continue;
-                int interpolated=g_game_spec.video->interpolate(phase,interpolation_image,s_frame_stride,s_screen_height);
-                const uint32_t *pixels=interpolated?interpolation_image:s_framebuf;
+                int interpolated=0,pw=s_screen_width,ph=s_screen_height,pstride=s_frame_stride;
+                const uint32_t *pixels=NULL;
+                if(hr_scale>1) {
+                    pw=s_screen_width*hr_scale;ph=s_screen_height*hr_scale;pstride=pw;
+                    interpolated=g_game_spec.video->interpolate_scaled(phase,hr_image,pstride,
+                        s_screen_width,s_screen_height,hr_scale);
+                    if(interpolated) {
+                        pixels=hr_image;
+                        if(s_color_lut_on){color_lut_map_frame(&s_color_lut,pixels,hr_present,pw,ph,pstride);pixels=hr_present;}
+                        SDL_UpdateTexture(hr_texture,NULL,pixels,pstride*(int)sizeof(uint32_t));
+                        SDL_Rect hsrc={0,0,pw,ph};
+                        SDL_RenderClear(renderer);SDL_RenderCopy(renderer,hr_texture,&hsrc,NULL);
+                    } else {pw=s_screen_width;ph=s_screen_height;pstride=s_frame_stride;}
+                }
+                if(!pixels) {
+                interpolated=g_game_spec.video->interpolate(phase,interpolation_image,s_frame_stride,s_screen_height);
+                pixels=interpolated?interpolation_image:s_framebuf;
                 if(s_color_lut_on) {
                     color_lut_map_frame(&s_color_lut,pixels,s_present_buf,s_screen_width,s_screen_height,s_frame_stride);
                     pixels=s_present_buf;
@@ -4365,6 +4407,7 @@ session_begin:;
                 SDL_Rect active={0,0,s_screen_width,s_screen_height};
                 SDL_UpdateTexture(texture,&active,pixels,s_frame_stride*(int)sizeof(uint32_t));
                 SDL_RenderClear(renderer);SDL_RenderCopy(renderer,texture,&src,NULL);
+                }
                 now=SDL_GetPerformanceCounter();
                 if(now<at)genesis_host_wait_until(at,perf_frequency);
                 draw_load_hold(renderer);
@@ -4372,14 +4415,15 @@ session_begin:;
                 ++presentation_count;interpolation_count+=interpolated!=0;
                 if(presentation_trace) {
                     uint64_t hash=14695981039346656037ull;
-                    for(int y=0;y<s_screen_height;++y)for(int x=0;x<s_screen_width;++x)
-                        {hash^=pixels[(size_t)y*s_frame_stride+x];hash*=1099511628211ull;}
+                    int hstep=pw/s_screen_width>0?pw/s_screen_width:1; /* sample scaled pictures */
+                    for(int y=0;y<ph;y+=hstep)for(int x=0;x<pw;x+=hstep)
+                        {hash^=pixels[(size_t)y*pstride+x];hash*=1099511628211ull;}
                     fprintf(presentation_trace,"%u,%llu,%.9f,%d,%llu,%016llx\n",frame_num,
                         (unsigned long long)presentation_count,phase,interpolated,
                         (unsigned long long)SDL_GetPerformanceCounter(),(unsigned long long)hash);
                 }
                 if(presentation_snap && presentation_count==presentation_snap_frame)
-                    png_write_argb(presentation_snap,pixels,s_screen_width,s_screen_height,s_frame_stride);
+                    png_write_argb(presentation_snap,pixels,pw,ph,pstride);
                 now=SDL_GetPerformanceCounter();
             }
         } else {
@@ -4429,7 +4473,8 @@ session_begin:;
     if(presentation_trace)fclose(presentation_trace);
     if(g_app_config.presentation_rate)fprintf(stderr,"[presentation] guest_ticks=%u presents=%llu interpolated=%llu counter_frequency=%llu\n",
         frame_num,(unsigned long long)presentation_count,(unsigned long long)interpolation_count,(unsigned long long)perf_frequency);
-    free(interpolation_image);
+    free(interpolation_image);free(hr_image);free(hr_present);
+    if(hr_texture)SDL_DestroyTexture(hr_texture);
     runner_sram_complete(1); /* settle last-frame ACK before final state/report */
     host_timing_dump(&host_timing, stderr);
     if (!window_close_requested || host_timing_dump_requested())
