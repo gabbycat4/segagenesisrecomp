@@ -2502,6 +2502,79 @@ static void replay_view(GenesisReplayView *v,int apply)
     }
 }
 
+/* GPU-composed in-between pictures (GameVideo.presentation_layers): each
+ * layer is a texture uploaded only when its version changes, then placed at
+ * fractional positions by the graphics card. Returns 0 if nothing was drawn. */
+static SDL_Renderer *s_gl_renderer;
+static SDL_Texture  *s_gl_tex[GAME_VIDEO_MAX_LAYERS];
+static int           s_gl_tw[GAME_VIDEO_MAX_LAYERS], s_gl_th[GAME_VIDEO_MAX_LAYERS];
+static uint64_t      s_gl_ver[GAME_VIDEO_MAX_LAYERS];
+static uint32_t     *s_gl_lut_buf; static size_t s_gl_lut_cap;
+static int present_layers(SDL_Renderer *renderer, const GameVideoLayer *L, int n, uint64_t *hash)
+{
+    if (renderer != s_gl_renderer) {           /* textures belong to one renderer */
+        if (s_gl_renderer) for (int i = 0; i < GAME_VIDEO_MAX_LAYERS; i++) if (s_gl_tex[i]) SDL_DestroyTexture(s_gl_tex[i]);
+        memset(s_gl_tex, 0, sizeof s_gl_tex); memset(s_gl_ver, 0, sizeof s_gl_ver);
+        s_gl_renderer = renderer;
+    }
+    int lw = 0, lh = 0;
+    SDL_RenderGetLogicalSize(renderer, &lw, &lh);
+    if (lw <= 0 || lh <= 0) SDL_GetRendererOutputSize(renderer, &lw, &lh);
+    if (lw <= 0 || lh <= 0 || s_screen_width <= 0 || s_screen_height <= 0) return 0;
+    float kx = (float)lw / (float)s_screen_width, ky = (float)lh / (float)s_screen_height;
+    for (int i = 0; i < n; i++) {
+        unsigned s = L[i].slot;
+        if (s >= GAME_VIDEO_MAX_LAYERS || L[i].width <= 0 || L[i].height <= 0 || !L[i].pixels) return 0;
+        if (!s_gl_tex[s] || s_gl_tw[s] < L[i].width || s_gl_th[s] < L[i].height) {
+            int tw = L[i].width > 384 ? L[i].width : 384, th = L[i].height > 288 ? L[i].height : 288;
+            if (s_gl_tex[s]) SDL_DestroyTexture(s_gl_tex[s]);
+            s_gl_tex[s] = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, tw, th);
+            if (!s_gl_tex[s]) { fprintf(stderr, "[presentation] layer texture: %s\n", SDL_GetError()); return 0; }
+            SDL_SetTextureBlendMode(s_gl_tex[s], SDL_BLENDMODE_BLEND);
+            SDL_SetTextureScaleMode(s_gl_tex[s], SDL_ScaleModeNearest);
+            s_gl_tw[s] = tw; s_gl_th[s] = th; s_gl_ver[s] = 0;
+        }
+        if (s_gl_ver[s] != L[i].version || !L[i].version) {
+            const uint32_t *px = L[i].pixels; int stride = L[i].stride;
+            if (s_color_lut_on) {
+                size_t need = (size_t)L[i].width * (size_t)L[i].height;
+                if (need > s_gl_lut_cap) {
+                    uint32_t *b = (uint32_t *)realloc(s_gl_lut_buf, need * sizeof *b);
+                    if (!b) return 0;
+                    s_gl_lut_buf = b; s_gl_lut_cap = need;
+                }
+                for (int y = 0; y < L[i].height; y++) for (int x = 0; x < L[i].width; x++) {
+                    uint32_t c = px[(size_t)y * (size_t)stride + (size_t)x];
+                    s_gl_lut_buf[(size_t)y * (size_t)L[i].width + (size_t)x] = c ? color_lut_map_argb(&s_color_lut, c) : 0u;
+                }
+                px = s_gl_lut_buf; stride = L[i].width;
+            }
+            SDL_Rect r = {0, 0, L[i].width, L[i].height};
+            if (SDL_UpdateTexture(s_gl_tex[s], &r, px, stride * (int)sizeof(uint32_t)) != 0) return 0;
+            s_gl_ver[s] = L[i].version;
+        }
+    }
+    SDL_RenderClear(renderer);
+    uint64_t h = 14695981039346656037ull;
+    for (int i = 0; i < n; i++) {
+        SDL_Rect clip = {0, 0, lw, lh};
+        if (L[i].clip_w > 0 && L[i].clip_h > 0) {
+            clip.x = (int)(L[i].clip_x * kx + 0.5f); clip.y = (int)(L[i].clip_y * ky + 0.5f);
+            clip.w = (int)((L[i].clip_x + L[i].clip_w) * kx + 0.5f) - clip.x;
+            clip.h = (int)((L[i].clip_y + L[i].clip_h) * ky + 0.5f) - clip.y;
+        }
+        SDL_RenderSetClipRect(renderer, &clip);
+        SDL_Rect src = {0, 0, L[i].width, L[i].height};
+        SDL_FRect dst = {L[i].x * kx, L[i].y * ky, (float)L[i].width * kx, (float)L[i].height * ky};
+        SDL_RenderCopyF(renderer, s_gl_tex[L[i].slot], &src, &dst);
+        uint64_t parts[3] = {L[i].version, (uint64_t)(int64_t)(L[i].x * 256.0f), (uint64_t)(int64_t)(L[i].y * 256.0f)};
+        for (int k = 0; k < 3; k++) { h ^= parts[k]; h *= 1099511628211ull; }
+    }
+    SDL_RenderSetClipRect(renderer, NULL);
+    *hash = h;
+    return 1;
+}
+
 int main(int argc, char *argv[])
 {
     cmd_server_owner_review_init(getenv("GENESIS_OWNER_REVIEW"));
@@ -3565,6 +3638,11 @@ session_begin:;
     /* High-resolution in-between pictures (GameVideo.interpolate_scaled). */
     uint32_t *hr_image=NULL,*hr_present=NULL;size_t hr_capacity=0;
     SDL_Texture *hr_texture=NULL;int hr_tw=0,hr_th=0;
+    /* GPU layers (GameVideo.presentation_layers): on unless GENESIS_GPU_LAYERS=0. */
+    const char *gpu_layers_env=getenv("GENESIS_GPU_LAYERS");
+    int gpu_layers_on=!(gpu_layers_env && *gpu_layers_env=='0');
+    GameVideoLayer gpu_layers[GAME_VIDEO_MAX_LAYERS];
+    uint64_t layered_count=0;
     uint64_t presentation_count=0,interpolation_count=0;
     int presentation_vsync=-1;
     SDL_RendererInfo initial_renderer_info={0};SDL_GetRendererInfo(renderer,&initial_renderer_info);
@@ -4122,6 +4200,7 @@ session_begin:;
                 if(presentation_trace)fclose(presentation_trace);
     if(g_app_config.presentation_rate)fprintf(stderr,"[presentation] guest_ticks=%u presents=%llu interpolated=%llu counter_frequency=%llu\n",
         frame_num,(unsigned long long)presentation_count,(unsigned long long)interpolation_count,(unsigned long long)perf_frequency);
+    if(g_app_config.presentation_rate)fprintf(stderr,"[presentation] GPU-layer pictures=%llu\n",(unsigned long long)layered_count);
     free(interpolation_image);free(hr_image);free(hr_present);
     if(hr_texture)SDL_DestroyTexture(hr_texture);
     host_timing_dump(&host_timing, stderr);
@@ -4385,7 +4464,13 @@ session_begin:;
                 if(now>at && now-at>(Uint64)((double)perf_frequency/display_rate))continue;
                 int interpolated=0,pw=s_screen_width,ph=s_screen_height,pstride=s_frame_stride;
                 const uint32_t *pixels=NULL;
-                if(hr_scale>1) {
+                int layered=0;uint64_t layer_hash=0;
+                if(gpu_layers_on && g_game_spec.video->presentation_layers && !g_app_config.linear_filter) {
+                    int nl=g_game_spec.video->presentation_layers(phase,gpu_layers,GAME_VIDEO_MAX_LAYERS,
+                        s_screen_width,s_screen_height);
+                    if(nl>0 && present_layers(renderer,gpu_layers,nl,&layer_hash)){layered=1;interpolated=1;++layered_count;}
+                }
+                if(!layered && hr_scale>1) {
                     pw=s_screen_width*hr_scale;ph=s_screen_height*hr_scale;pstride=pw;
                     interpolated=g_game_spec.video->interpolate_scaled(phase,hr_image,pstride,
                         s_screen_width,s_screen_height,hr_scale);
@@ -4397,7 +4482,7 @@ session_begin:;
                         SDL_RenderClear(renderer);SDL_RenderCopy(renderer,hr_texture,&hsrc,NULL);
                     } else {pw=s_screen_width;ph=s_screen_height;pstride=s_frame_stride;}
                 }
-                if(!pixels) {
+                if(!layered && !pixels) {
                 interpolated=g_game_spec.video->interpolate(phase,interpolation_image,s_frame_stride,s_screen_height);
                 pixels=interpolated?interpolation_image:s_framebuf;
                 if(s_color_lut_on) {
@@ -4413,7 +4498,11 @@ session_begin:;
                 draw_load_hold(renderer);
                 SDL_RenderPresent(renderer);
                 ++presentation_count;interpolation_count+=interpolated!=0;
-                if(presentation_trace) {
+                if(presentation_trace && layered) {
+                    fprintf(presentation_trace,"%u,%llu,%.9f,%d,%llu,%016llx\n",frame_num,
+                        (unsigned long long)presentation_count,phase,2,
+                        (unsigned long long)SDL_GetPerformanceCounter(),(unsigned long long)layer_hash);
+                } else if(presentation_trace) {
                     uint64_t hash=14695981039346656037ull;
                     int hstep=pw/s_screen_width>0?pw/s_screen_width:1; /* sample scaled pictures */
                     for(int y=0;y<ph;y+=hstep)for(int x=0;x<pw;x+=hstep)
@@ -4422,7 +4511,7 @@ session_begin:;
                         (unsigned long long)presentation_count,phase,interpolated,
                         (unsigned long long)SDL_GetPerformanceCounter(),(unsigned long long)hash);
                 }
-                if(presentation_snap && presentation_count==presentation_snap_frame)
+                if(!layered && presentation_snap && presentation_count==presentation_snap_frame)
                     png_write_argb(presentation_snap,pixels,pw,ph,pstride);
                 now=SDL_GetPerformanceCounter();
             }
@@ -4473,6 +4562,7 @@ session_begin:;
     if(presentation_trace)fclose(presentation_trace);
     if(g_app_config.presentation_rate)fprintf(stderr,"[presentation] guest_ticks=%u presents=%llu interpolated=%llu counter_frequency=%llu\n",
         frame_num,(unsigned long long)presentation_count,(unsigned long long)interpolation_count,(unsigned long long)perf_frequency);
+    if(g_app_config.presentation_rate)fprintf(stderr,"[presentation] GPU-layer pictures=%llu\n",(unsigned long long)layered_count);
     free(interpolation_image);free(hr_image);free(hr_present);
     if(hr_texture)SDL_DestroyTexture(hr_texture);
     runner_sram_complete(1); /* settle last-frame ACK before final state/report */

@@ -19,6 +19,22 @@ typedef const uint32_t *(*GameVideoNativeRow)(void *ctx);
  * requested width and raises the main CPU divisor while it is on -- so the
  * configured mode (and a window-derived width) is session configuration
  * online: runner/netplay/genesis_netplay.h, GenesisSessionConfig.video. */
+/* One layer of a GPU-composed in-between picture (GameVideo.presentation_layers).
+ * Pixels are ARGB, alpha 0 = transparent, anything else opaque; they belong to
+ * the adapter and must stay unchanged while (slot, version) is unchanged: the
+ * runner uploads a slot's texture only when its version changes. x/y place
+ * the layer's top-left in native screen pixels and may be fractional; the clip
+ * rectangle (native pixels, clip_w <= 0 = the whole screen) limits it. */
+#define GAME_VIDEO_MAX_LAYERS 32
+typedef struct GameVideoLayer {
+    const uint32_t *pixels;
+    int width, height, stride;          /* stride in pixels */
+    unsigned slot;                      /* 0 .. GAME_VIDEO_MAX_LAYERS-1 */
+    uint64_t version;
+    float x, y;
+    int clip_x, clip_y, clip_w, clip_h;
+} GameVideoLayer;
+
 typedef struct GameVideo {
     /* off, fit, stage, or a positive W:H ratio. Return 0 for invalid input. */
     int (*configure)(const char *mode);
@@ -85,6 +101,13 @@ typedef struct GameVideo {
     int (*presentation_scale)(void);
     int (*interpolate_scaled)(double phase, uint32_t *image, int stride,
                               int width, int height, int scale);
+    /* Optional GPU-composed in-between pictures (appended). Fill up to max
+     * layers, back to front, for the picture at `phase` and return the count;
+     * return zero to use interpolate_scaled()/interpolate()/the ordinary image
+     * for this picture. Only used with nearest filtering. Same rules as
+     * interpolate(): owned snapshots only. GENESIS_GPU_LAYERS=0 disables it. */
+    int (*presentation_layers)(double phase, GameVideoLayer *layers, int max,
+                               int width, int height);
 } GameVideo;
 
 /* Host-local derived frame plan, never deterministic machine/snapshot state.
